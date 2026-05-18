@@ -4,7 +4,6 @@
 const PDFJS_VERSION = '4.7.76';
 const PDFJS_URL = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.mjs`;
 const PDFJS_WORKER_URL = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
-const EPUBJS_URL = 'https://cdn.jsdelivr.net/npm/epubjs@0.3.93/dist/epub.min.js';
 const JSZIP_URL = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
 
 const titleFromFilename = (name) => name.replace(/\.[^.]+$/, '');
@@ -70,17 +69,40 @@ function loadScript(url) {
   });
 }
 
-let epubReady = null;
-function loadEpubjs() {
-  if (!epubReady) {
-    epubReady = (async () => {
+let jszipReady = null;
+function loadJSZip() {
+  if (!jszipReady) {
+    jszipReady = (async () => {
       await loadScript(JSZIP_URL);
-      await loadScript(EPUBJS_URL);
-      if (!window.ePub) throw new Error('epub.js failed to initialize');
-      return window.ePub;
+      if (!window.JSZip) throw new Error('JSZip failed to load.');
+      return window.JSZip;
     })();
   }
-  return epubReady;
+  return jszipReady;
+}
+
+// Resolve a spine item's href relative to the OPF file's directory,
+// collapsing `..` / `.` and decoding percent-escapes.
+function resolveZipPath(opfPath, href) {
+  const cleanHref = decodeURIComponent(href.split('#')[0]);
+  const baseDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/') + 1) : '';
+  const parts = (baseDir + cleanHref).split('/');
+  const out = [];
+  for (const p of parts) {
+    if (p === '..') out.pop();
+    else if (p && p !== '.') out.push(p);
+  }
+  return out.join('/');
+}
+
+function zipFileCaseInsensitive(zip, path) {
+  const direct = zip.file(path);
+  if (direct) return direct;
+  const lower = path.toLowerCase();
+  for (const name of Object.keys(zip.files)) {
+    if (name.toLowerCase() === lower) return zip.file(name);
+  }
+  return null;
 }
 
 function stripHtml(html) {
@@ -98,34 +120,76 @@ function stripHtml(html) {
 }
 
 export async function parseEpub(file, onProgress) {
-  const ePub = await loadEpubjs();
+  const JSZip = await loadJSZip();
   const buf = await file.arrayBuffer();
-  const book = ePub(buf);
-  await book.ready;
+  const zip = await JSZip.loadAsync(buf);
 
-  const spine = book.spine?.spineItems || [];
-  let title = file.name;
-  try {
-    const meta = await book.loaded.metadata;
-    if (meta?.title) title = meta.title;
-  } catch {}
+  // EPUBs declare the package (OPF) file via META-INF/container.xml.
+  const containerEntry = zipFileCaseInsensitive(zip, 'META-INF/container.xml');
+  if (!containerEntry) throw new Error('Not a valid EPUB: missing META-INF/container.xml.');
+  const containerXml = await containerEntry.async('string');
+  const container = new DOMParser().parseFromString(containerXml, 'application/xml');
+  const rootfile = container.getElementsByTagName('rootfile')[0];
+  const opfPath = rootfile?.getAttribute('full-path');
+  if (!opfPath) throw new Error('Not a valid EPUB: no rootfile in container.xml.');
+
+  const opfEntry = zipFileCaseInsensitive(zip, opfPath);
+  if (!opfEntry) throw new Error(`EPUB package file not found at ${opfPath}.`);
+  const opfXml = await opfEntry.async('string');
+  const opf = new DOMParser().parseFromString(opfXml, 'application/xml');
+
+  // Title from Dublin Core metadata, with fallbacks.
+  let title = '';
+  const DC_NS = 'http://purl.org/dc/elements/1.1/';
+  const titleEl =
+    opf.getElementsByTagNameNS(DC_NS, 'title')[0] ||
+    opf.querySelector('metadata > title') ||
+    opf.querySelector('title');
+  if (titleEl?.textContent) title = titleEl.textContent.trim();
+
+  // Build manifest (id -> href) and resolve the spine reading order.
+  const manifest = {};
+  for (const item of opf.getElementsByTagName('item')) {
+    const id = item.getAttribute('id');
+    const href = item.getAttribute('href');
+    if (id && href) manifest[id] = href;
+  }
+  const spineRefs = Array.from(opf.getElementsByTagName('itemref'))
+    .map((ref) => ref.getAttribute('idref'))
+    .map((id) => manifest[id])
+    .filter(Boolean);
+
+  if (spineRefs.length === 0) throw new Error('EPUB has no readable spine items.');
 
   const chunks = [];
-  for (let i = 0; i < spine.length; i++) {
-    const item = spine[i];
-    try {
-      const doc = await item.load(book.load.bind(book));
-      const html = doc?.documentElement?.outerHTML || '';
-      chunks.push(stripHtml(html));
-      item.unload();
-    } catch {
-      // Skip unreadable spine items rather than aborting the whole book.
+  const failures = [];
+  for (let i = 0; i < spineRefs.length; i++) {
+    const fullPath = resolveZipPath(opfPath, spineRefs[i]);
+    const entry = zipFileCaseInsensitive(zip, fullPath);
+    if (!entry) {
+      failures.push(fullPath);
+    } else {
+      try {
+        const html = await entry.async('string');
+        const text = stripHtml(html);
+        if (text.trim()) chunks.push(text);
+      } catch (err) {
+        failures.push(fullPath);
+      }
     }
-    if (onProgress) onProgress((i + 1) / spine.length);
+    if (onProgress) onProgress((i + 1) / spineRefs.length);
+  }
+
+  if (chunks.length === 0) {
+    throw new Error(
+      failures.length
+        ? `EPUB unreadable: could not extract text from spine (${failures.length} files).`
+        : 'EPUB unreadable: spine produced no text.'
+    );
   }
 
   return {
-    title: titleFromFilename(title) || titleFromFilename(file.name),
+    title: title || titleFromFilename(file.name),
     type: 'epub',
     text: chunks.join('\n\n'),
   };
